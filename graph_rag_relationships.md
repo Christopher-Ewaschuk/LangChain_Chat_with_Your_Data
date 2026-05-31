@@ -481,4 +481,121 @@ Hierarchy Context: It came from Employee Handbook 2026 under Section 1.
 
 Downstream Tasks: It lets the LLM know: "Hey, this paragraph explicitly references 'Section 3: Family Medical Leave'. Do you want to pull that text too before answering?"
 
+pdfs
+
+Parsing PDFs for Graph RAG is notoriously tricky because standard PDF parsers throw away the exact thing you need most: visual structure.
+
+When a standard parser converts a PDF to plain text, titles, subsections, tables, and paragraphs collapse into a single giant wall of text. The deterministic parent-child extraction we discussed earlier breaks down because you lose the visual cues of what is a "Header" vs. what is a "Paragraph."
+
+To make Graph RAG work with PDFs without using arbitrary text overlaps, you must use a Layout-Aware PDF Parser to reconstruct the document's physical hierarchy before sending it to Neo4j.
+
+1. The Stack: Layout-Aware Parsing
+Instead of standard tools like PyPDF, you should use parsers that use object detection or deep layout analysis to identify structural elements (Headers, Text, Tables). Great options include:
+
+unstructured (Excellent native integration with LangChain)
+
+Marker / PyMuPDF4LLM (Converts PDFs directly into clean Markdown)
+
+LlamaParse (Cloud-based, exceptional at preserving complex hierarchies and tables)
+
+For policy PDFs, converting the PDF into Markdown first is the path of least resistance because Markdown preserves structural metadata (like # and ##) natively.
+
+2. Implementation: From PDF to Linked Paragraphs
+Here is how to ingest a policy PDF, extract its visual structure, chunk it cleanly without overlaps, and link it into a parent-child graph layout using LangChain and Python.
+
+Python
+import os
+import uuid
+from langchain_community.document_loaders import PyMuPDF4LLM
+from langchain_text_splitters import MarkdownHeaderTextSplitter
+from langchain_community.graphs import Neo4jGraph
+
+# 1. Connect to Neo4j
+graph = Neo4jGraph()
+
+# 2. Extract PDF straight into clean Markdown text
+# PyMuPDF4LLM detects fonts/sizes to guess headers (#, ##) automatically
+pdf_path = "company_travel_policy.pdf"
+md_docs = PyMuPDF4LLM(pdf_path).load()
+full_markdown_text = md_docs[0].page_content 
+
+# 3. Split based on visual hierarchy (Headers) instead of character counts
+headers_to_split_on = [
+    ("#", "Document"),
+    ("##", "Section"),
+    ("###", "SubSection")
+]
+markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+semantic_chunks = markdown_splitter.split_text(full_markdown_text)
+
+# 4. Ingest into Neo4j, creating structural relationships
+doc_id = f"doc_{str(uuid.uuid4())[:6]}"
+doc_title = os.path.basename(pdf_path)
+
+# Track previous paragraph to link sequential chunks together
+prev_paragraph_id = None
+
+for chunk in semantic_chunks:
+    section_title = chunk.metadata.get("Section", "General Rules")
+    subsection_title = chunk.metadata.get("SubSection", "Standard Protocol")
+    paragraph_text = chunk.page_content
+    paragraph_id = f"p_{str(uuid.uuid4())[:8]}"
+    
+    # Cypher query to build the layout hierarchy
+    cypher_query = """
+    MERGE (d:Document {id: $doc_id}) SET d.title = $doc_title
+    MERGE (s:Section {title: $section_title})
+    MERGE (sub:SubSection {title: $subsection_title})
+    MERGE (p:Paragraph {id: $p_id}) SET p.text = $p_text
+    
+    // Draw structural lines
+    MERGE (d)-[:HAS_SECTION]->(s)
+    MERGE (s)-[:HAS_SUBSECTION]->(sub)
+    MERGE (sub)-[:HAS_PARAGRAPH]->(p)
+    """
+    
+    graph.query(cypher_query, {
+        "doc_id": doc_id, "doc_title": doc_title,
+        "section_title": section_title, "subsection_title": subsection_title,
+        "p_id": paragraph_id, "p_text": paragraph_text
+    })
+    
+    # Replaces 'Overlap': Link sequential paragraphs together
+    if prev_paragraph_id:
+        link_query = """
+        MATCH (prev:Paragraph {id: $prev_id}), (curr:Paragraph {id: $curr_id})
+        MERGE (prev)-[:NEXT_PARAGRAPH]->(curr)
+        """
+        graph.query(link_query, {"prev_id": prev_paragraph_id, "curr_id": paragraph_id})
+        
+    prev_paragraph_id = paragraph_id
+3. Handling the "PDF Table" Nightmare
+Policies are packed with tables (e.g., Expense allowance limits by tier). If you split text blindly by character counts, tables turn into useless gibberish.
+
+When using a layout parser like PyMuPDF4LLM or unstructured, tables are typically converted into HTML string format (<table>...</table>) or clean Markdown tables inside the text block.
+
+The Graph RAG Way to Store Tables:
+Do not treat a table like a standard paragraph. Give it its own identity in your graph:
+
+(:SubSection) ──[:HAS_TABLE]──> (:Table {html_content: "...", summary: "..."})
+Extract: Let your parser isolate the table object.
+
+Summarize: Run the table through an LLM to generate a plain-text summary (e.g., "Table showing standard hotel allowance caps per city tier").
+
+Embed & Store: Compute the vector embedding on the summary, but store both the summary and the raw HTML/Markdown string on the graph node.
+
+Query: When the vector search matches the summary, your LangGraph retriever hands the raw, perfectly formatted table matrix to the LLM.
+
+4. The Payoff in LangGraph
+Because your parser reconstructed the PDF layout, your LangGraph retrieval agent can adapt to messy user questions.
+
+If a user asks: "What does section 4 say?", standard vector RAG fails because "Section 4" doesn't have a distinct semantic vector semantic profile. But your Graph RAG agent can circumvent vector search entirely and run a deterministic structural query:
+
+Cypher
+MATCH (:Document {title: "travel_policy.pdf"})-[:HAS_SECTION]->(s:Section)
+WHERE s.title CONTAINS "Section 4"
+MATCH (s)-[:HAS_SUBSECTION]->()-[:HAS_PARAGRAPH]->(p:Paragraph)
+RETURN p.text ORDER BY p.id
+This structural fallback guarantees that your agent finds the exact data required, even if the user didn't use the precise semantic keywords found inside the PDF paragraphs.
+
 Are you planning on updating these policies frequently, or is this a static set of documents? Knowing this can help structure how we handle document versions and [:SUPERSEDES] relationships.
