@@ -124,6 +124,81 @@ Hallucination Checker: Operates post-generation. It cross-references the drafted
 4. State Management (The Memory)
 Because Agentic RAG systems loop through multi-step logic paths, they require a persistent memory layer to track progress. In framework tools like LangGraph, this is managed by a shared State Object.
 
+
+what nodes will be required in agentic rag?
+
+When designing a state-graph architecture for an Agentic RAG system using LangGraph, Nodes are the building blocks of execution. In LangGraph, a node is simply a Python function that consumes the current global State object, performs a specialized task (usually involving ChatGPT or database I/O), updates the state keys, and returns them.  
+Towards AI
+
+A robust, production-grade Corrective and Self-Reflective Agentic RAG system requires a set of specialized nodes, categorized by their structural roles.  
+Medium
+
+1. The Entry & Routing Nodes
+These nodes sit at the front door of your system. They parse the user’s intent and prevent the application from wastefully burning OpenAI token budgets.
+
+Intent_Classifier_Node
+Purpose: Analyzes the raw incoming prompt before hitting your databases.
+
+Logic: Uses a highly structured ChatGPT call (via Pydantic output) to classify the query type.
+
+Outcomes: It routes greetings to a generic response node, filters out abusive or out-of-scope inputs, and sends valid information requests to the retrieval engine.
+
+Query_Decomposer_Node (Optional / For Complex Queries)
+Purpose: Handles "multi-hop" reasoning. If a user asks a double-barreled question (e.g., "Compare our 2024 financial revenue against our Q1 2026 targets"), a single database lookup will fail.
+
+Logic: ChatGPT splits the core prompt into an ordered list of distinct sub-queries stored in the graph state.
+
+2. The Action Nodes (Retrieval & Tools)
+These nodes interact with the physical infrastructure of your application.
+
+Retrieve_Documents_Node
+Purpose: Fetches raw relevant context chunks.
+
+Logic: Takes the current query from the state, runs it through an embedding model, and queries your vector repository (e.g., Pinecone, Chroma) or an alternative data source like an SQL DB. It saves the array of raw document objects directly into state["documents"].
+
+Web_Search_Fallback_Node
+Purpose: Acts as an alternative data gathering tool when your internal knowledge base lacks the answer.
+
+Logic: Invokes a web search API (like Tavily or DuckDuckGo) using a search query formulated by the agent, appending these external results to the document state.
+
+3. The Quality Control Nodes (The Critics)
+These nodes provide the "agentic" self-correcting capabilities. They act as automated quality gates.
+
+Document_Grader_Node
+Purpose: Evaluates whether the retrieved documents are actually relevant to the user’s question.  
+Medium
+
+Logic: Iterates through state["documents"]. It passes the user question and each text chunk to ChatGPT, forcing a binary structured output: {"relevance": "yes" | "no"}. If a chunk is irrelevant, it drops it from the state.
+
+Query_Rewriter_Node
+Purpose: Optimizes the search query if the Document_Grader_Node determines that the fetched documents were low quality.
+
+Logic: Looks at the initial failed query and uses ChatGPT to generate a smarter, more semantically rich search variation optimized for vector DB matching. It increments a state["retry_count"] to prevent infinite loops.
+
+4. The Generation & Guardrail Nodes
+These nodes construct the final output and ensure it is mathematically grounded in reality.
+
+Generate_Answer_Node
+Purpose: Synthesizes the verified context chunks into a coherent, human-readable response.
+
+Logic: Standard LLM call to ChatGPT using a system prompt explicitly instructing it to only use the verified documents stored in state["documents"] to answer state["question"]. The output is written to state["generation"].
+
+Hallucination_Guard_Node
+Purpose: Cross-checks the drafted response against the retrieved source documents before streaming it to the user.
+
+Logic: Asks ChatGPT to verify if every fact asserted in state["generation"] is explicitly supported by state["documents"].
+
+Outcomes: If it passes, the graph ends and streams the answer. If it detects a hallucination, it routes back to a re-writer or regeneration node.
+
+How They Connect: A Blueprint Summary
+In LangGraph, you construct your workflow using these nodes combined with conditional routing logic:
+
+From Node	Condition Explored	To Next Node
+Intent_Classifier	Is it a valid RAG query?	Retrieve_Documents (Yes) OR Direct_Response (No)
+Document_Grader	Are any documents relevant?	Generate_Answer (Yes) OR Query_Rewriter (No)
+Query_Rewriter	Has retry_count exceeded maximum limit (e.g., 3)?	Web_Search_Fallback (Yes) OR Retrieve_Documents (No)
+Hallucination_Guard	Is the answer perfectly grounded?	END (Yes) OR Generate_Answer / Query_Rewriter (No)
+Implementation Tip: Keep your nodes entirely deterministic and focused on a single responsibility. Let LangGraph's conditional_edges handle the branching decisions by evaluating variables stored cleanly inside your central State definition.
 Thread Memory: Keeps track of conversational history so the user can ask follow-up questions contextually.
 
 Internal Graph State: Stores variables generated during execution (e.g., a list of successfully verified documents, the number of retry attempts, and current sub-queries). This ensures the agent doesn't get stuck in an infinite loop of rewriting questions.
